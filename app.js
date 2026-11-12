@@ -8,6 +8,7 @@ const configured = firebaseConfig?.apiKey && !String(firebaseConfig.apiKey).incl
 const app = configured ? initializeApp(firebaseConfig) : null, auth = app ? getAuth(app) : null, db = app ? getDatabase(app) : null;
 let uid, code, unsubscribe, room, busy = false, demoMode = false;
 let previousLife = {};
+let connectionUnsub=null; let connected=false; let activeModalTab="counters"; let lastFocusLife=null;
 let eventBusy = false;
 const THEMES={white:['#f7d991','#b88945','☼'],blue:['#77cfff','#2377ba','💧'],black:['#d5a3ff','#6635a2','☠'],red:['#ff9470','#b73a24','🔥'],green:['#8fe2a2','#267d52','🌳']};
 const defaults=()=>({poison:0,experience:0,energy:0,rad:0,tickets:0,commanderDamage:{},theme:'white',customCounters:{},wallpaper:null,commanderSlots:1});
@@ -78,13 +79,13 @@ function setBusy(v){busy=v;$('create').disabled=v;$('join').disabled=v;}
 async function ensureAuth(){if(!auth)throw Error('Configure Firebase to use live multiplayer. You can use Preview instead.');if(uid)return uid; const credential=await signInAnonymously(auth);uid=credential.user.uid;return uid;}
 async function create(){if(busy)return;setBusy(true);msg('');try{await ensureAuth();let c;for(let i=0;i<8;i++){c=makeCode();if(!(await get(ref(db,`rooms/${c}`))).exists())break;}if((await get(ref(db,`rooms/${c}`))).exists())throw Error('Could not generate a free code. Try again.');const life=Number($('starting').value);await set(ref(db,`rooms/${c}`),{host:uid,startingLife:life,createdAt:serverTimestamp(),turnNumber:1,players:{[uid]:{name:playerName(),life,online:true,...defaults()}}});enter(c);}catch(e){msg(e.message)}finally{setBusy(false)}}
 async function join(c){if(busy)return;setBusy(true);msg('');try{await ensureAuth();c=c.trim().toUpperCase();if(!/^[A-Z2-9]{6}$/.test(c))throw Error('Enter a valid six-character code.');const snap=await get(ref(db,`rooms/${c}`));if(!snap.exists())throw Error('Game not found.');const data=snap.val();if(!data.players?.[uid])await set(ref(db,`rooms/${c}/players/${uid}`),{name:playerName(),life:data.startingLife,online:true,...defaults()});else await update(ref(db,`rooms/${c}/players/${uid}`),{online:true});enter(c);}catch(e){msg(e.message)}finally{setBusy(false)}}
-function enter(c){if(unsubscribe)unsubscribe();code=c;saveRoom(c);$('setup').hidden=true;$('game').hidden=false;$('roomcode').textContent=c;const presence=ref(db,`rooms/${c}/players/${uid}/online`);onDisconnect(presence).set(false).catch(console.error);unsubscribe=onValue(ref(db,`rooms/${c}`),snap=>{if(!snap.exists()){msg('Game closed.');leave();return;}room=snap.val();render();},err=>msg(err.message));}
+function enter(c){document.body.classList.add('in-game');if(unsubscribe)unsubscribe();if(connectionUnsub){connectionUnsub();connectionUnsub=null;}code=c;saveRoom(c);$('setup').hidden=true;$('game').hidden=false;$('roomcode').textContent=c;const presence=ref(db,`rooms/${c}/players/${uid}/online`);onDisconnect(presence).set(false).catch(console.error);connectionUnsub=onValue(ref(db,'.info/connected'),snap=>{connected=!!snap.val();updateConnection()});unsubscribe=onValue(ref(db,`rooms/${c}`),snap=>{if(!snap.exists()){msg('Game closed.');leave();return;}room=snap.val();render();},err=>msg(err.message));}
 function render(){
- const players=room.players||{};
+ const players=room.players||{};updateConnection();
  $('status').textContent=demoMode?'✧ Interactive preview · local only':`${Object.values(players).filter(p=>p.online).length} online · ${Object.keys(players).length} players`;
  $('reset').hidden=demoMode?false:room.host!==uid;
  $('focus').hidden=false;
- $('focuslife').textContent=players[uid]?.life??room.startingLife;document.querySelector('.focus-ring').classList.remove('burst');void document.querySelector('.focus-ring').offsetWidth;document.querySelector('.focus-ring').classList.add('burst');
+ const nextLife=players[uid]?.life??room.startingLife;const changedLife=lastFocusLife!==null&&nextLife!==lastFocusLife;const lifeDelta=changedLife?nextLife-lastFocusLife:0;$('focuslife').textContent=nextLife;if(changedLife)playLifeEffect(lifeDelta);lastFocusLife=nextLife;
  renderExtras();
  renderUtilities();
  const holder=$('players');holder.replaceChildren();
@@ -96,14 +97,14 @@ function render(){
   const head=document.createElement('div');head.className='playerhead';const name=document.createElement('h3');name.textContent=p.name;
   const tag=document.createElement('span');tag.className='tag';tag.textContent=id===uid?'✦ YOU':p.online?'● ONLINE':'○ OFFLINE';head.append(name,tag);
   const life=document.createElement('div');life.className='life';life.textContent=p.life;card.append(head,life);const stats=document.createElement('div');stats.className='player-stats';stats.textContent=`☠ ${p.poison||0}  ✦ ${p.experience||0}  ⚡ ${p.energy||0}`;card.append(stats);
-  if(previousLife[id]!==undefined&&previousLife[id]!==p.life){card.classList.add('changed');card.classList.add(p.life>previousLife[id]?'gain':'loss');}
+  if(previousLife[id]!==undefined&&previousLife[id]!==p.life){card.classList.add('changed');card.classList.add(p.life>previousLife[id]?'gain':'loss');const bubble=document.createElement('span');bubble.className='floating-change '+(p.life>previousLife[id]?'positive':'negative');const diff=p.life-previousLife[id];bubble.textContent=(diff>0?'+':'')+diff;card.append(bubble);}
   previousLife[id]=p.life;holder.append(card);
  }
 }
 async function changeLife(delta){if(room?.finished)return msg('Game has finished.');if(demoMode){room.players[uid].life+=delta;render();await logEvent('life',`Life ${delta>0?'+':''}${delta} → ${room.players[uid].life}`);return;}try{const result=await runTransaction(ref(db,`rooms/${code}/players/${uid}/life`),value=>typeof value==='number'?value+delta:undefined);if(result.committed)await logEvent('life',`Life ${delta>0?'+':''}${delta} → ${result.snapshot.val()}`);}catch(e){msg(e.message)}}
 async function reset(){if(!room||(room.host!==uid&&!demoMode))return;if(!confirm('Reset all life totals?'))return;if(demoMode){Object.values(room.players).forEach(p=>{p.life=room.startingLife;p.poison=0;p.experience=0;p.energy=0;p.rad=0;p.tickets=0;p.commanderDamage={};Object.keys(p.customCounters||{}).forEach(k=>p.customCounters[k].value=0)});render();return;}try{const updates={};for(const id of Object.keys(room.players||{})){updates[`players/${id}/life`]=room.startingLife;updates[`players/${id}/poison`]=0;updates[`players/${id}/experience`]=0;updates[`players/${id}/energy`]=0;updates[`players/${id}/rad`]=0;updates[`players/${id}/tickets`]=0;updates[`players/${id}/commanderDamage`]=null;}await update(ref(db,`rooms/${code}`),updates);}catch(e){msg(e.message)}}
-function leave(){demoMode=false;previousLife={};$('focus').hidden=true;if(unsubscribe){unsubscribe();unsubscribe=null;}localStorage.removeItem('mtg-room');code=null;room=null;$('setup').hidden=false;$('game').hidden=true;}
-$('demo').onclick=()=>{demoMode=true;uid='demo-me';code='K7M2Q8';room={host:uid,turnNumber:1,events:{},startingLife:Number($('starting').value),players:{'demo-me':{name:playerName(),life:Number($('starting').value),online:true,...defaults()},'demo-2':{name:'Player 2',life:36,online:true,...defaults()},'demo-3':{name:'Player 3',life:28,online:true,...defaults()},'demo-4':{name:'Player 4',life:40,online:true,...defaults()}}};$('setup').hidden=true;$('game').hidden=false;$('roomcode').textContent=code;render();};
+function leave(){document.body.classList.remove('in-game');demoMode=false;uid=auth?.currentUser?.uid;previousLife={};lastFocusLife=null;closeTools();if(connectionUnsub){connectionUnsub();connectionUnsub=null;}connected=false;$('focus').hidden=true;if(unsubscribe){unsubscribe();unsubscribe=null;}localStorage.removeItem('mtg-room');code=null;room=null;$('setup').hidden=false;$('game').hidden=true;}
+$('demo').onclick=()=>{document.body.classList.add('in-game');demoMode=true;connected=true;lastFocusLife=null;uid='demo-me';code='K7M2Q8';room={host:uid,turnNumber:1,events:{},startingLife:Number($('starting').value),players:{'demo-me':{name:playerName(),life:Number($('starting').value),online:true,...defaults()},'demo-2':{name:'Player 2',life:36,online:true,...defaults()},'demo-3':{name:'Player 3',life:28,online:true,...defaults()},'demo-4':{name:'Player 4',life:40,online:true,...defaults()}}};$('setup').hidden=true;$('game').hidden=false;$('roomcode').textContent=code;render();};
 document.querySelectorAll('[data-counter]').forEach(b=>b.onclick=()=>adjustCounter(b.dataset.counter,Number(b.dataset.step)));
 document.querySelectorAll('[data-delta]').forEach(b=>b.onclick=()=>changeLife(Number(b.dataset.delta)));
 $('create').onclick=create;$('join').onclick=()=>join($('code').value);$('reset').onclick=reset;$('leave').onclick=async()=>{const old=code;const wasDemo=demoMode;leave();if(old&&uid&&!wasDemo&&db)try{await set(ref(db,`rooms/${old}/players/${uid}/online`),false)}catch(e){msg(e.message)}};$('copy').onclick=async()=>{if(demoMode){msg('Preview code is illustrative; create a game after Firebase setup.');return;}try{await navigator.clipboard.writeText(`${location.origin}${location.pathname}?game=${code}`);$('copy').textContent='Copied!';}catch{msg('Share this game code: '+code)}};
@@ -136,3 +137,34 @@ document.querySelectorAll('.arcane-tab').forEach(tab=>tab.addEventListener('clic
  document.querySelectorAll('.arcane-tab').forEach(b=>{const selected=b===tab;b.classList.toggle('selected',selected);b.setAttribute('aria-selected',String(selected))});
  document.querySelectorAll('.arcane-pane').forEach(p=>p.hidden=p.id!=='pane-'+key);
 }));
+
+// v6: Mobile modal tools, feedback, and live connection state.
+const modal=$('tools-modal');
+function openTools(key='counters'){
+ activeModalTab=key;
+ document.querySelectorAll('.arcane-tab').forEach(b=>{const selected=b.dataset.tab===key;b.classList.toggle('selected',selected);b.setAttribute('aria-selected',String(selected))});
+ document.querySelectorAll('.arcane-pane').forEach(p=>p.hidden=p.id!=='pane-'+key);
+ modal.hidden=false;document.body.classList.add('modal-open');
+ $('close-tools').focus();
+}
+function closeTools(){modal.hidden=true;document.body.classList.remove('modal-open')}
+document.querySelectorAll('[data-open]').forEach(b=>b.addEventListener('click',()=>openTools(b.dataset.open)));
+$('close-tools').onclick=closeTools;
+modal.addEventListener('click',e=>{if(e.target===modal)closeTools()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!modal.hidden)closeTools()});
+function updateConnection(){const pill=$('connection-pill');if(!pill)return;const online=demoMode||connected;const text=demoMode?'Preview':!navigator.onLine?'Offline':online?'Live sync':'Reconnecting';pill.dataset.state=online?'online':'offline';$('connection-text').textContent=text;}
+window.addEventListener('online',updateConnection);window.addEventListener('offline',updateConnection);
+function vibrate(pattern){if(navigator.vibrate)try{navigator.vibrate(pattern)}catch{}}
+function playLifeEffect(delta){
+ const ring=document.querySelector('.focus-ring');ring.classList.remove('burst','life-heal','life-hurt');void ring.offsetWidth;ring.classList.add('burst',delta>0?'life-heal':'life-hurt');
+ vibrate(delta>0?18:[24,30,32]);
+ const layer=$('life-particles');layer.replaceChildren();
+ const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
+ if(reduced)return;
+ for(let i=0;i<14;i++){const particle=document.createElement('i');particle.className='magic-particle '+(delta>0?'healing':'damage-particle');particle.style.setProperty('--angle',String((i/14)*Math.PI*2));particle.style.setProperty('--distance',(52+Math.random()*75)+'px');particle.style.setProperty('--delay',(Math.random()*.12)+'s');layer.append(particle)}
+ const floater=document.createElement('div');floater.className='screen-floater '+(delta>0?'positive':'negative');floater.textContent=(delta>0?'+':'')+delta;document.getElementById('fx-layer').append(floater);setTimeout(()=>floater.remove(),950);
+ setTimeout(()=>layer.replaceChildren(),950);
+}
+// Keep profile accessible from the compact in-game view without hiding Google sign-in.
+$('profile-open').onclick=()=>{const p=$('account-panel');p.classList.toggle('profile-expanded');if(p.classList.contains('profile-expanded'))p.scrollIntoView({behavior:'smooth',block:'nearest'})};
+// Art URLs come from Scryfall, but remain cosmetic and optional.
